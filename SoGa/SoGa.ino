@@ -1,14 +1,17 @@
 #include <Adafruit_LSM9DS1.h>
 #include <Adafruit_Sensor.h>
+#include <Wire.h>
+#include "BluetoothSerial.h"
+BluetoothSerial SerialBT;
 
 #define UNINITIALIZED -1
 #define GREEN 0
 #define YELLOW 1
 #define RED 2
 
-#define PIN_GREEN 11
-#define PIN_YELLOW 12
-#define PIN_RED 13
+#define PIN_GREEN 18
+#define PIN_YELLOW 19
+#define PIN_RED 23
 
 #define HEIGHT_YELLOW_CM 10
 #define HEIGHT_RED_CM 20
@@ -28,6 +31,8 @@ unsigned long lastTime = 0;
 int currentState = GREEN;
 
 void setup() {
+  Wire.begin(21, 22);
+
   Serial.begin(9600);
   while (!Serial);
   Serial.println("Started");
@@ -66,7 +71,7 @@ void loop() {
   }
 
   // Update velocity and position only if not zero
-  if (az > 0) {
+  if (az != 0) {
     velocity += az * dt;
     position += velocity * dt;
     lastMotionTime = currentTime;
