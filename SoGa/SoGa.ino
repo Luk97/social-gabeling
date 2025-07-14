@@ -17,7 +17,7 @@ Adafruit_LSM9DS1 lsm = Adafruit_LSM9DS1();
 void setup() {
   Wire.begin(SDA_PIN, SCL_PIN);
 
-  Serial.begin(9600);
+  Serial.begin(115200);
   while (!Serial);
   Serial.println("Started");
 

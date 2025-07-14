@@ -8,8 +8,8 @@ BluetoothSerial SerialBT;
 #define PIN_SCL 23
 #define PIN_GREEN 18
 #define PIN_YELLOW 19
-#define PIN_RED 23
-#define PIN_BLUE 17
+#define PIN_RED 21
+#define PIN_BLUE 25
 
 #define UNINITIALIZED -1
 #define GREEN 0
@@ -22,7 +22,7 @@ BluetoothSerial SerialBT;
 #define RESET_AFTER_MS 5000
 #define DELAY_MS 200
 
-#define BAUD_RATE 9600
+#define BAUD_RATE 115200
 #define ACCEL_NOISE_THRESHOLD 0.2   // Ignore small accelerations (we will have to adjust this)
 #define IDLE_THRESHOLD_MS 1000      // If nearly no motion for this time, reset position
 #define GREEN_YELLOW_THRESHOLD 2
@@ -41,7 +41,7 @@ uint8_t slaveEspAddress[] = {0xEC, 0x94, 0xCB, 0x6F, 0xE5, 0x1A};
 
 void setup() {
   Serial.begin(BAUD_RATE);
-  Wire.begin(22, 23);
+  Wire.begin(PIN_SDA, PIN_SCL);
   while (!Serial);
   Serial.println("Started");
 
