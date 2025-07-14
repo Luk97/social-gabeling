@@ -1,12 +1,16 @@
 #include <Adafruit_LSM9DS1.h>
 #include <Adafruit_Sensor.h>
 #include <Wire.h>
+#include <deque>
 #include "BluetoothSerial.h"
 
-BluetoothSerial SerialBT;
-Adafruit_LSM9DS1 lsm = Adafruit_LSM9DS1();
 
-// Pin definitions
+// ---------- Constants ----------
+#define BAUD_RATE 115200
+#define DELAY_LOOP_MS 200
+#define DELAY_STATE_CHANGE_MS 5000
+#define CONNECT_RETRY_MS 5000
+
 #define PIN_SDA 22
 #define PIN_SCL 23
 #define PIN_GREEN 18
@@ -14,156 +18,192 @@ Adafruit_LSM9DS1 lsm = Adafruit_LSM9DS1();
 #define PIN_RED 21
 #define PIN_BLUE 25
 
-// States
-#define GREEN 0
-#define YELLOW 1
-#define RED 2
+#define STATE_GREEN 0
+#define STATE_YELLOW 1
+#define STATE_RED 2
 
-// Constants
-#define BAUD_RATE 115200
-#define DELAY_MS 200
-#define DELAY_STATE_CHANGE_MS 5000
-#define CONNECT_INTERVAL_MS 5000
+#define REST_MAGNITUDE 9.81
+#define BITE_THRESHOLD 1.5             // Threshold to detect bite (delta from rest)
+#define BITE_DEBOUNCE_MS 1500          // Minimum time between bite detections
+#define BITE_WINDOW_MS 60000           // 1 minute window for calculating bites/min
+#define BITE_UPDATE_INTERVAL_MS 5000   // Update LEDs every 5s
 
-#define ACCEL_NOISE_THRESHOLD 0.2
 #define GREEN_YELLOW_THRESHOLD 1.5
 #define YELLOW_RED_THRESHOLD 4
 
-// Global variables
-unsigned long lastStateChangeTime = 0;
-unsigned long lastTime = 0;
-unsigned long lastConnectAttempt = 0;
-int currentState = GREEN;
 
+// ---------- Globals ----------
+BluetoothSerial SerialBT;
+Adafruit_LSM9DS1 lsm = Adafruit_LSM9DS1();
+
+std::deque<unsigned long> biteTimestamps;
+unsigned long lastBiteTime = 0;
+unsigned long lastRateUpdate = 0;
+unsigned long lastStateChangeTime = 0;
+unsigned long lastConnectAttempt = 0;
+bool inMotion = false;
+float masterRate = 0.0;
+
+int currentState = STATE_GREEN;
 uint8_t slaveEspAddress[] = {0xEC, 0x94, 0xCB, 0x6F, 0xCA, 0x02};
 
+
+// ---------- Setup ----------
 void setup() {
-  // Initialize Serial
   Serial.begin(BAUD_RATE);
   while (!Serial);
-  Serial.println("Started");
+  Serial.println("Master ESP started");
 
-  // Initialize Pins
   Wire.begin(PIN_SDA, PIN_SCL);
   pinMode(PIN_GREEN, OUTPUT);
   pinMode(PIN_YELLOW, OUTPUT);
   pinMode(PIN_RED, OUTPUT);
   pinMode(PIN_BLUE, OUTPUT);
 
-  setLED(GREEN); // Default LED state
-
-  // Initialize LSM9DS1 sensor
   if (!lsm.begin()) {
-    Serial.println("LSM9DS1 not found, restarting in 5s...");
+    Serial.println("LSM9DS1 not found, restarting...");
     delay(5000);
     ESP.restart();
   }
   lsm.setupAccel(lsm.LSM9DS1_ACCELRANGE_2G);
 
-  // Initialize Bluetooth
   if (!SerialBT.begin("ESP32Master", true)) {
-    Serial.println("An error occurred initializing Bluetooth");
+    Serial.println("Bluetooth init failed");
     return;
-  } else {
-    Serial.println("Successfully initialized Bluetooth");
   }
 
-  delay(500); // Allow BT stack to stabilize
-
-  // Try initial connection to slave
-  Serial.println("Trying to connect to Slave ESP...");
-  if (SerialBT.connect(slaveEspAddress)) {
-    Serial.println("Connected to slave ESP!");
-  } else {
-    Serial.println("Failed to connect to slave ESP!");
-  }
+  Serial.println("Bluetooth ready (ESP32Master)");
+  delay(500);
+  tryConnectToSlave();
 
   printMacAddress();
-
-  lastTime = millis();
-  lastConnectAttempt = millis();
 }
 
+
+// ---------- Loop ----------
 void loop() {
+  digitalWrite(PIN_BLUE, SerialBT.connected() ? HIGH : LOW);
+
   if (SerialBT.connected()) {
-    // Read sensor data
-    sensors_event_t accel, mag, gyro, temp;
-    lsm.getEvent(&accel, &mag, &gyro, &temp);
-
-    unsigned long now = millis();
-    float dt = (now - lastTime) / 1000.0;
-    lastTime = now;
-
-    // Calculate master speed
-    float x = accel.acceleration.x;
-    float y = accel.acceleration.y;
-    float z = accel.acceleration.z;
-    float magnitude = sqrt(x * x + y * y + z * z);
-    float masterSpeed = abs(magnitude - 9.81);
-
-    Serial.print("masterSpeed: ");
-    Serial.print(masterSpeed);
-
-    // Retrieve speed from slave
-    if (SerialBT.available()) {
-      String received = SerialBT.readStringUntil('\n');
-      received.trim();
-      if (received.length() > 0) {
-        float slaveSpeed = received.toFloat();
-        Serial.print("\tReceived slave speed: ");
-        Serial.println(slaveSpeed);
-
-        // Apply noise filter
-        if (masterSpeed < ACCEL_NOISE_THRESHOLD) masterSpeed = 0.0;
-        if (slaveSpeed < ACCEL_NOISE_THRESHOLD) slaveSpeed = 0.0;
-
-        // Check if enough time has passed since last state change
-        if (millis() - lastStateChangeTime >= DELAY_STATE_CHANGE_MS) {
-          float speedDelta = abs(masterSpeed - slaveSpeed);
-          Serial.print("speedDelta: ");
-          Serial.println(speedDelta);
-          if (speedDelta < GREEN_YELLOW_THRESHOLD) {
-            setLED(GREEN);
-            SerialBT.println(GREEN);
-          } else if (speedDelta < YELLOW_RED_THRESHOLD) {
-            setLED(YELLOW);
-            SerialBT.println(YELLOW);
-          } else {
-            setLED(RED);
-            SerialBT.println(RED);
-          }
-          lastStateChangeTime = now;
-        }
-      } else {
-        Serial.println("\tReceived empty speed string");
-      }
-    } else {
-      Serial.println("\tNo slave speed received");
-    }
-
-    digitalWrite(PIN_BLUE, HIGH);
+    handleSensorAndBiteDetection();
+    updateBiteRate();
+    receiveSlaveRateAndUpdateLEDs();
   } else {
-    unsigned long now = millis();
-    if (now - lastConnectAttempt >= CONNECT_INTERVAL_MS) {
-      Serial.println("Not connected to slave ESP. Retrying...");
-      if (SerialBT.connect(slaveEspAddress)) {
-        Serial.println("Reconnected to slave ESP!");
-      } else {
-        Serial.println("Reconnect attempt failed");
-      }
-      lastConnectAttempt = now;
-    }
-    digitalWrite(PIN_BLUE, LOW);
+    handleReconnect();
   }
 
-  delay(DELAY_MS);
+  delay(DELAY_LOOP_MS);
 }
 
+
+// ---------- Functions ----------
+
+/// Tries to connect to the slave ESP
+void tryConnectToSlave() {
+  Serial.println("Attempting to connect to slave...");
+  if (SerialBT.connect(slaveEspAddress)) {
+    Serial.println("Connected to slave!");
+  } else {
+    Serial.println("Connection failed");
+  }
+}
+
+/// Attempts to reconnect if not connected
+void handleReconnect() {
+  unsigned long now = millis();
+  if (now - lastConnectAttempt >= CONNECT_RETRY_MS) {
+    tryConnectToSlave();
+    lastConnectAttempt = now;
+  }
+}
+
+/// Reads sensor and detects new bite events
+void handleSensorAndBiteDetection() {
+  sensors_event_t accel, mag, gyro, temp;
+  lsm.getEvent(&accel, &mag, &gyro, &temp);
+
+  float x = accel.acceleration.x;
+  float y = accel.acceleration.y;
+  float z = accel.acceleration.z;
+  float magnitude = sqrt(x * x + y * y + z * z);
+  float accelDelta = abs(magnitude - REST_MAGNITUDE);
+
+  unsigned long now = millis();
+
+  // Bite start
+  if (accelDelta > BITE_THRESHOLD && !inMotion && (now - lastBiteTime > BITE_DEBOUNCE_MS)) {
+    inMotion = true;
+    lastBiteTime = now;
+    biteTimestamps.push_back(now);
+    Serial.println("Detected bite!");
+  }
+
+  // Return to idle
+  if (accelDelta < BITE_THRESHOLD * 0.7 && inMotion) {
+    inMotion = false;
+  }
+}
+
+/// Computes rolling bite rate from master fork
+void updateBiteRate() {
+  unsigned long now = millis();
+  if (now - lastRateUpdate < BITE_UPDATE_INTERVAL_MS) return;
+
+  while (!biteTimestamps.empty() && (now - biteTimestamps.front() > BITE_WINDOW_MS)) {
+    biteTimestamps.pop_front();
+  }
+
+  masterRate = biteTimestamps.size() * (60000.0 / BITE_WINDOW_MS);
+  Serial.print("Master bite rate: ");
+  Serial.println(masterRate);
+
+  lastRateUpdate = now;
+}
+
+/// Receives slave rate and determines LED feedback
+void receiveSlaveRateAndUpdateLEDs() {
+  if (!SerialBT.available()) return;
+
+  String received = SerialBT.readStringUntil('\n');
+  received.trim();
+  if (received.length() == 0) {
+    Serial.println("Received empty slave rate");
+    return;
+  }
+
+  float slaveRate = received.toFloat();
+  Serial.print("Slave bite rate: ");
+  Serial.println(slaveRate);
+
+  if (masterRate < 0.1) masterRate = 0.0;
+  if (slaveRate < 0.1) slaveRate = 0.0;
+
+  float delta = abs(masterRate - slaveRate);
+  Serial.print("Rate delta: ");
+  Serial.println(delta);
+
+  unsigned long now = millis();
+  if (now - lastStateChangeTime >= DELAY_STATE_CHANGE_MS) {
+    if (delta < GREEN_YELLOW_THRESHOLD) {
+      setLED(STATE_GREEN);
+      SerialBT.println(STATE_GREEN);
+    } else if (delta < YELLOW_RED_THRESHOLD) {
+      setLED(STATE_YELLOW);
+      SerialBT.println(STATE_YELLOW);
+    } else {
+      setLED(STATE_RED);
+      SerialBT.println(STATE_RED);
+    }
+    lastStateChangeTime = now;
+  }
+}
+
+/// Updates onboard LED state
 void setLED(int state) {
   currentState = state;
-  digitalWrite(PIN_GREEN, state == GREEN ? HIGH : LOW);
-  digitalWrite(PIN_YELLOW, state == YELLOW ? HIGH : LOW);
-  digitalWrite(PIN_RED, state == RED ? HIGH : LOW);
+  digitalWrite(PIN_GREEN, state == STATE_GREEN ? HIGH : LOW);
+  digitalWrite(PIN_YELLOW, state == STATE_YELLOW ? HIGH : LOW);
+  digitalWrite(PIN_RED, state == STATE_RED ? HIGH : LOW);
 }
 
 // Print MAC address (only for debug)

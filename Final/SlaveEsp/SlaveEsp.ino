@@ -1,10 +1,13 @@
 #include <Adafruit_LSM9DS1.h>
 #include <Adafruit_Sensor.h>
 #include <Wire.h>
+#include <deque>
 #include "BluetoothSerial.h"
 
-BluetoothSerial SerialBT;
-Adafruit_LSM9DS1 lsm = Adafruit_LSM9DS1();
+
+// ---------- Constants ----------
+#define BAUD_RATE 115200
+#define DELAY_LOOP_MS 200
 
 #define PIN_SDA 22
 #define PIN_SCL 23
@@ -13,99 +16,132 @@ Adafruit_LSM9DS1 lsm = Adafruit_LSM9DS1();
 #define PIN_RED 21
 #define PIN_BLUE 25
 
-#define UNINITIALIZED -1
-#define GREEN 0
-#define YELLOW 1
-#define RED 2
+#define STATE_GREEN 0
+#define STATE_YELLOW 1
+#define STATE_RED 2
 
-#define BAUD_RATE 115200
-#define DELAY_MS 200
+#define REST_MAGNITUDE 9.81
+#define BITE_THRESHOLD 1.5             // Threshold to detect bite (delta from rest)
+#define BITE_DEBOUNCE_MS 1500          // Minimum time between bite detections
+#define BITE_WINDOW_MS 60000           // 1 minute window for calculating bites/min
+#define BITE_UPDATE_INTERVAL_MS 5000   // Update LEDs every 5s
 
-float velocityX = 0;
-float velocityY = 0;
-float velocityZ = 0;
-unsigned long lastTime = 0;
-float idleTime = 0;
-int currentState = GREEN;
 
+// ---------- Globals ----------
+BluetoothSerial SerialBT;
+Adafruit_LSM9DS1 lsm = Adafruit_LSM9DS1();
+
+std::deque<unsigned long> biteTimestamps;
+unsigned long lastBiteTime = 0;
+unsigned long lastRateUpdate = 0;
+bool inMotion = false;
+
+
+// ---------- Setup ----------
 void setup() {
-  // Initialize Serial
   Serial.begin(BAUD_RATE);
   while (!Serial);
   Serial.println("Started");
   
-  // Initialize Pins
   Wire.begin(PIN_SDA, PIN_SCL);
+
   pinMode(PIN_GREEN, OUTPUT);
   pinMode(PIN_YELLOW, OUTPUT);
   pinMode(PIN_RED, OUTPUT);
   pinMode(PIN_BLUE, OUTPUT);
 
-  // Initialize LSM
   if (!lsm.begin()) {
     Serial.println("LSM9DS1 not found");
     while (1);
   }
   lsm.setupAccel(lsm.LSM9DS1_ACCELRANGE_2G);
 
-  // Initialize Bluetooth
   SerialBT.begin("ESP32Slave");
   Serial.println("Bluetooth device ready, name is ESP32Slave");
   printMacAddress();
-
-  setLED(currentState);
-  lastTime = millis();
 }
 
+
+// ---------- Loop ----------
 void loop() {
+  digitalWrite(PIN_BLUE, SerialBT.connected() ? HIGH : LOW);
+
   if (SerialBT.connected()) {
-    // Read sensor data
-    sensors_event_t accel, mag, gyro, temp;
-    lsm.getEvent(&accel, &mag, &gyro, &temp);
-
-    unsigned long now = millis();
-    float dt = (now - lastTime) / 1000.0;
-    lastTime = now;
-
-    // Raw acceleration values
-    float x = accel.acceleration.x;
-    float y = accel.acceleration.y;
-    float z = accel.acceleration.z;
-
-    // Speed calculation
-    float magnitude = sqrt(x * x + y * y + z * z);
-    float speed = abs(magnitude - 9.81);
-    Serial.print("Speed: ");
-    Serial.println(speed);
-
-    // Send speed to master
-    SerialBT.println(speed);
-
-    // Retrieve LED signal from master
-    if (SerialBT.available()) {
-      String received = SerialBT.readStringUntil('\n');
-      int signal = received.toInt();
-      Serial.print("\tReceived signal: ");
-      Serial.println(signal);
-      setLED(signal);
-    }
-
-    digitalWrite(PIN_BLUE, HIGH);
-  } else {
-    digitalWrite(PIN_BLUE, LOW);
+    handleSensorAndBiteDetection();
+    updateBiteRateAndSend();
+    receiveAndSetLED();
   }
-  delay(DELAY_MS);
+
+  delay(DELAY_LOOP_MS);
 }
 
+
+// ---------- Functions ----------
+
+/// Reads sensor and detects new bite events
+void handleSensorAndBiteDetection() {
+  sensors_event_t accel, mag, gyro, temp;
+  lsm.getEvent(&accel, &mag, &gyro, &temp);
+
+  float x = accel.acceleration.x;
+  float y = accel.acceleration.y;
+  float z = accel.acceleration.z;
+  float magnitude = sqrt(x * x + y * y + z * z);
+  float accelDelta = abs(magnitude - REST_MAGNITUDE);
+
+  unsigned long now = millis();
+
+  // Bite start
+  if (accelDelta > BITE_THRESHOLD && !inMotion && (now - lastBiteTime > BITE_DEBOUNCE_MS)) {
+    inMotion = true;
+    lastBiteTime = now;
+    biteTimestamps.push_back(now);
+    Serial.println("Bite detected!");
+  }
+
+  // Return to idle
+  if (accelDelta < BITE_THRESHOLD * 0.7 && inMotion) {
+    inMotion = false;
+  }
+}
+
+/// Computes rolling bite rate and sends it via Bluetooth
+void updateBiteRateAndSend() {
+  unsigned long now = millis();
+  if (now - lastRateUpdate < BITE_UPDATE_INTERVAL_MS) return;
+
+  // Clean up timestamps
+  while (!biteTimestamps.empty() && (now - biteTimestamps.front() > BITE_WINDOW_MS)) {
+    biteTimestamps.pop_front();
+  }
+
+  float bitesPerMinute = biteTimestamps.size() * (60000.0 / BITE_WINDOW_MS);
+  Serial.print("Bite rate: ");
+  Serial.println(bitesPerMinute);
+
+  SerialBT.println(bitesPerMinute);
+  lastRateUpdate = now;
+}
+
+/// Receives LED state from master and updates pins
+void receiveAndSetLED() {
+  if (!SerialBT.available()) return;
+
+  String received = SerialBT.readStringUntil('\n');
+  int state = received.toInt();
+  Serial.print("Received LED state: ");
+  Serial.println(state);
+  setLED(state);
+}
+
+/// Updates onboard LED state
 void setLED(int state) {
-  currentState = state;
-  digitalWrite(PIN_GREEN, state == GREEN ? HIGH : LOW);
-  digitalWrite(PIN_YELLOW, state == YELLOW ? HIGH : LOW);
-  digitalWrite(PIN_RED, state == RED ? HIGH : LOW);
+  digitalWrite(PIN_GREEN, state == STATE_GREEN ? HIGH : LOW);
+  digitalWrite(PIN_YELLOW, state == STATE_YELLOW ? HIGH : LOW);
+  digitalWrite(PIN_RED, state == STATE_RED ? HIGH : LOW);
 }
 
-// Print MAC address (only for debug)
-// Last address: EC:94:CB:6F:CA:02
+/// Debug function to print MAC address
 void printMacAddress() {
   uint8_t mac[6];
   SerialBT.getBtAddress(mac);
